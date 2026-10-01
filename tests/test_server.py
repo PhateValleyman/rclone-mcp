@@ -39,6 +39,26 @@ class ServerTests(unittest.TestCase):
         out = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "delete", "arguments": {"remote": "a", "path": "x"}}}, mode="full")
         self.assertNotIn("error", out[0])
 
+    def test_config_discovery_and_create(self):
+        out = run_server(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "config_providers", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "config_create", "arguments": {"name": "demo", "provider_type": "local", "values": {"nounc": True}}}},
+            mode="readwrite",
+        )
+        self.assertEqual(out[0]["result"]["isError"], False)
+        self.assertEqual(json.loads(out[0]["result"]["content"][0]["text"]), {"local": {"Name": "local", "Options": []}})
+        self.assertEqual(out[1]["result"]["isError"], False)
+
+    def test_config_delete_requires_confirmation(self):
+        out = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "config_delete", "arguments": {"name": "demo"}}}, mode="full")
+        self.assertTrue(out[0]["result"]["isError"])
+        self.assertIn("confirm=true", out[0]["result"]["content"][0]["text"])
+
+    def test_config_interactive_requires_explicit_answers(self):
+        out = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "config_interactive", "arguments": {}}}, mode="readwrite")
+        self.assertTrue(out[0]["result"]["isError"])
+        self.assertIn("input_lines is required", out[0]["result"]["content"][0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

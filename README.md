@@ -26,9 +26,9 @@ The `rclone` executable must be available in `PATH`.
 |---|---|
 | `readonly` (default) | listing, metadata, reading, search, check, duplicate scan |
 | `readwrite` | readonly + upload, download, mkdir, copy, move, links |
-| `full` | readwrite + sync, delete, purge, dedupe |
+| `full` | readwrite + sync, delete, purge, dedupe, remote-definition deletion |
 
-Destructive tools default to `dry_run=true` even in `full` mode. Set `dry_run=false` only when the caller explicitly intends the operation.
+Destructive tools default to `dry_run=true` even in `full` mode. Set `dry_run=false` only when the caller explicitly intends the operation. `config_delete` and `config_password` additionally require `confirm=true`.
 
 Useful environment variables:
 
@@ -67,7 +67,20 @@ For write access, change only the mode intentionally. Never put credentials in t
 
 ## Tools
 
-`rclone_version`, `list_remotes`, `list_files`, `stat`, `read_file`, `download`, `upload`, `mkdir`, `copy`, `move`, `sync`, `delete`, `purge`, `create_link`, `search`, `check`, `find_duplicates`, and `dedupe`.
+`rclone_version`, `list_remotes`, `config_file`, `config_show`, `config_providers`, `config_create`, `config_update`, `config_unset`, `config_delete`, `config_password`, `config_reconnect`, `config_interactive`, `config_continue`, `list_files`, `stat`, `read_file`, `download`, `upload`, `mkdir`, `copy`, `move`, `sync`, `delete`, `purge`, `create_link`, `search`, `check`, `find_duplicates`, and `dedupe`.
+
+### Managing `rclone.conf`
+
+Configuration tools call the installed rclone binary rather than parsing or rewriting the INI file themselves. This preserves rclone's provider-specific validation, password obscuring, OAuth flow and config-file locking.
+
+- `config_show` uses `rclone config redacted`; secrets are not returned in clear text.
+- `config_providers` exposes the provider schemas from `rclone config providers`, which lets an LLM build a provider-specific form.
+- `config_create` and `config_update` accept provider option values and use `--non-interactive` by default. Password fields can be obscured with `obscure=true`.
+- `config_continue` supports rclone's JSON state machine for provider questions: call it with the returned `state`, selected `result`, and any defaults.
+- `config_interactive` runs the native wizard from a supplied `input_lines` array. It never reads the MCP transport's stdin, so it cannot steal protocol messages or hang waiting for a hidden prompt.
+- `config_delete` is available only in `full` mode and requires `confirm=true`.
+
+Configuration changes should use a dedicated `RCLONE_CONFIG` file when possible. Do not put clear-text credentials in client configuration files or logs.
 
 `find_duplicates` scans one or more remotes using rclone's reported hashes, with a size fallback when no hash exists. It returns duplicate groups with remote, path, size, and hash. For large stores use `max_files_per_remote` and `max_groups`.
 

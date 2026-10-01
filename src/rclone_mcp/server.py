@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -80,6 +81,25 @@ class RcloneMCP:
         if ranks[self.mode] < ranks[level]:
             raise PolicyError(f"operation requires RCLONE_MCP_MODE={level} (current: {self.mode})")
 
+    @staticmethod
+    def _config_name(name: str) -> str:
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name):
+            raise PolicyError("invalid config name; use 1-128 letters, numbers, '.', '-' or '_'")
+        return name
+
+    @staticmethod
+    def _config_pairs(values: dict[str, Any]) -> list[str]:
+        if not isinstance(values, dict):
+            raise PolicyError("values must be an object of rclone option names and values")
+        result: list[str] = []
+        for key, value in values.items():
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(key)) or str(key).startswith("-"):
+                raise PolicyError(f"invalid rclone option name: {key}")
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, separators=(",", ":"))
+            result += [str(key), str(value)]
+        return result
+
     def _run(self, args: list[str], *, json_output: bool = False) -> Any:
         command = [self.rclone]
         if self.config:
@@ -101,10 +121,42 @@ class RcloneMCP:
             return json.loads(output or "null")
         return output
 
+    def _run_interactive(self, args: list[str], input_lines: list[str]) -> str:
+        if not isinstance(input_lines, list) or not input_lines:
+            raise PolicyError("input_lines is required; MCP stdio cannot safely share an interactive stdin")
+        command = [self.rclone]
+        if self.config:
+            command += ["--config", self.config]
+        command += args
+        try:
+            result = subprocess.run(command, input="\n".join(str(x) for x in input_lines) + "\n", capture_output=True, text=True, timeout=self.timeout, check=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"rclone executable not found: {self.rclone}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"rclone timed out after {self.timeout}s") from exc
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(f"rclone exited with {result.returncode}: {detail[-4000:]}")
+        output = result.stdout
+        if len(output) > self.max_output:
+            raise RuntimeError(f"rclone output exceeds {self.max_output} bytes")
+        return output
+
     def tools(self) -> list[dict[str, Any]]:
         return [
             self._tool("rclone_version", "Return rclone and server versions.", {}),
             self._tool("list_remotes", "List configured rclone remotes.", {}),
+            self._tool("config_file", "Return the active rclone configuration file path.", {}),
+            self._tool("config_show", "Show the rclone configuration with secrets redacted by rclone.", {"remote": self._str("")}),
+            self._tool("config_providers", "Return all supported rclone providers and their option schemas.", {}),
+            self._tool("config_create", "Create a remote from a provider type and option values.", {"name": self._str(), "provider_type": self._str(), "values": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean", "array", "object"]}}, "non_interactive": self._bool(True), "obscure": self._bool(False)}),
+            self._tool("config_update", "Update options of an existing remote.", {"name": self._str(), "values": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean", "array", "object"]}}, "non_interactive": self._bool(True), "obscure": self._bool(False)}),
+            self._tool("config_unset", "Remove named options from an existing remote.", {"name": self._str(), "keys": self._arr()}),
+            self._tool("config_delete", "Delete a remote definition from rclone.conf.", {"name": self._str(), "confirm": self._bool(False)}),
+            self._tool("config_password", "Update and obscure a password option in an existing remote.", {"name": self._str(), "key": self._str(), "value": self._str(), "confirm": self._bool(False)}),
+            self._tool("config_reconnect", "Re-authenticate an existing remote through rclone.", {"name": self._str(), "all": self._bool(False)}),
+            self._tool("config_interactive", "Run the native rclone interactive configuration wizard with supplied answers.", {"input_lines": {"type": "array", "items": {"type": "string"}}, "all": self._bool(False)}),
+            self._tool("config_continue", "Continue rclone's non-interactive provider configuration state machine.", {"name": self._str(), "state": self._str(), "result": self._str(), "values": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}}),
             self._tool("list_files", "List files and directories on a remote.", {"remote": self._str(), "path": self._str(""), "recursive": self._bool(False), "files_only": self._bool(False), "max_depth": self._int(0)}),
             self._tool("stat", "Return metadata for a remote path.", {"remote": self._str(), "path": self._str()}),
             self._tool("read_file", "Read a UTF-8 text file from a remote.", {"remote": self._str(), "path": self._str(), "max_bytes": self._int(1_000_000)}),
@@ -145,6 +197,51 @@ class RcloneMCP:
     def call(self, name: str, a: dict[str, Any]) -> Any:
         if name == "rclone_version": return {"server": SERVER_VERSION, "rclone": self._run(["version", "--checkers", "1"])}
         if name == "list_remotes": return {"remotes": [x.rstrip(":") for x in self._run(["listremotes"]).splitlines() if x.strip()]}
+        if name == "config_file": return {"path": self._run(["config", "file"]).strip()}
+        if name == "config_show":
+            remote = a.get("remote", "")
+            args = ["config", "redacted"] + ([self._config_name(remote)] if remote else [])
+            return {"config": self._run(args)}
+        if name == "config_providers": return self._run(["config", "providers"], json_output=True)
+        if name in {"config_create", "config_update"}:
+            self._require("readwrite")
+            remote_name = self._config_name(a["name"]); values = self._config_pairs(a.get("values", {}))
+            if name == "config_create":
+                provider_type = str(a["provider_type"])
+                if not re.fullmatch(r"[A-Za-z0-9_.-]+", provider_type): raise PolicyError("invalid provider type")
+                args = ["config", "create", remote_name, provider_type] + values
+            else:
+                args = ["config", "update", remote_name] + values
+            if a.get("non_interactive", True): args.append("--non-interactive")
+            if a.get("obscure"): args.append("--obscure")
+            return {"output": self._run(args)}
+        if name == "config_unset":
+            self._require("readwrite"); remote_name = self._config_name(a["name"])
+            keys = self._config_pairs({key: "" for key in a.get("keys", [])})[::2]
+            if not keys: raise PolicyError("keys must contain at least one option")
+            return {"output": self._run(["config", "unset", remote_name] + keys)}
+        if name == "config_delete":
+            self._require("full")
+            if not a.get("confirm", False): raise PolicyError("config_delete requires confirm=true")
+            return {"output": self._run(["config", "delete", self._config_name(a["name"])])}
+        if name == "config_password":
+            self._require("readwrite")
+            if not a.get("confirm", False): raise PolicyError("config_password requires confirm=true")
+            key = str(a["key"])
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", key): raise PolicyError("invalid password option name")
+            return {"output": self._run(["config", "password", self._config_name(a["name"]), key, str(a["value"])])}
+        if name == "config_reconnect":
+            self._require("readwrite"); args = ["config", "reconnect", self._config_name(a["name"]) + ":"]
+            if a.get("all"): args.append("--all")
+            return {"output": self._run(args)}
+        if name == "config_interactive":
+            self._require("readwrite")
+            args = ["config"] + (["--all"] if a.get("all") else [])
+            return {"output": self._run_interactive(args, a.get("input_lines", []))}
+        if name == "config_continue":
+            self._require("readwrite"); args = ["config", "update", self._config_name(a["name"]), "--continue", "--state", str(a["state"]), "--result", str(a["result"])]
+            args += self._config_pairs(a.get("values", {}))
+            return {"output": self._run(args, json_output=False)}
         if name == "list_files":
             args = ["lsjson", self._remote_path(a["remote"], a.get("path", "")), "--no-modtime"]
             if a.get("recursive"): args.append("--recursive")
