@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -39,7 +40,8 @@ class RcloneMCP:
             raise ValueError("RCLONE_MCP_MODE must be readonly, readwrite, or full")
         allowed = os.environ.get("RCLONE_MCP_ALLOWED_REMOTES", "")
         self.allowed_remotes = {x.strip().rstrip(":") for x in allowed.split(",") if x.strip()}
-        self.local_root = Path(os.environ.get("RCLONE_MCP_LOCAL_ROOT", "/tmp/rclone-mcp")).expanduser().resolve()
+        default_local_root = Path(tempfile.gettempdir()) / "rclone-mcp"
+        self.local_root = Path(os.environ.get("RCLONE_MCP_LOCAL_ROOT", str(default_local_root))).expanduser().resolve()
         self.local_root.mkdir(parents=True, exist_ok=True)
         self.timeout = _env_int("RCLONE_MCP_TIMEOUT", 300)
         self.max_output = _env_int("RCLONE_MCP_MAX_OUTPUT", 2_000_000)
