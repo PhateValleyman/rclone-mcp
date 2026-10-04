@@ -20,10 +20,13 @@ elif cmd == "config":
     elif sub == "providers": print(json.dumps({"local": {"Name": "local", "Options": []}}))
     else: print("ok")
 elif cmd == "lsjson":
-    print(json.dumps([
-        {"Path": "one.txt", "Name": "one.txt", "Size": 10, "Hashes": {"MD5": "same"}},
-        {"Path": "unique.txt", "Name": "unique.txt", "Size": 20, "Hashes": {"MD5": "unique"}},
-    ]))
+    if "--stat" in args:
+        print(json.dumps({"Path": "one.txt", "Name": "one.txt", "Size": 10, "IsDir": False}))
+    else:
+        print(json.dumps([
+            {"Path": "one.txt", "Name": "one.txt", "Size": 10, "Hashes": {"MD5": "same"}},
+            {"Path": "unique.txt", "Name": "unique.txt", "Size": 20, "Hashes": {"MD5": "unique"}},
+        ]))
 elif cmd in {"delete", "purge", "sync", "copy", "move", "mkdir", "copyto", "link", "dedupe", "check", "cat", "size", "lsf"}:
     if cmd == "cat": print("hello")
     elif cmd == "size": print(json.dumps({"count": 1, "bytes": 10}))

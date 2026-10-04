@@ -16,8 +16,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from . import __version__
+
 SERVER_NAME = "rclone-mcp"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = __version__
 PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -110,7 +112,7 @@ class RcloneMCP:
             command += ["--config", self.config]
         command += args
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=self.timeout, check=False)
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=self.timeout, check=False)
         except FileNotFoundError as exc:
             raise RuntimeError(f"rclone executable not found: {self.rclone}") from exc
         except subprocess.TimeoutExpired as exc:
@@ -176,7 +178,7 @@ class RcloneMCP:
             self._tool("search", "Search remote paths by name or glob pattern.", {"remote": self._str(), "path": self._str(""), "pattern": self._str(), "max_results": self._int(1000)}),
             self._tool("check", "Compare source and destination for equality.", {"source_remote": self._str(), "source_path": self._str(""), "destination_remote": self._str(), "destination_path": self._str(""), "size_only": self._bool(False)}),
             self._tool("find_duplicates", "Find duplicate files within or across remotes using hashes and size fallback.", {"remotes": self._arr(), "path": self._str(""), "by": self._enum(["hash", "size", "hash_or_size"], "hash_or_size"), "max_files_per_remote": self._int(100000), "max_groups": self._int(1000)}),
-            self._tool("dedupe", "Run rclone dedupe interactively in a chosen mode.", {"remote": self._str(), "path": self._str(), "dedupe_mode": self._enum(["interactive", "skip", "first", "newest", "oldest", "largest", "smallest", "rename"], "skip"), "dry_run": self._bool(True)}),
+            self._tool("dedupe", "Resolve duplicate files using a non-interactive strategy.", {"remote": self._str(), "path": self._str(), "dedupe_mode": self._enum(["skip", "first", "newest", "oldest", "largest", "smallest", "rename"], "skip"), "dry_run": self._bool(True)}),
             self._tool("mount_start", "Start a foreground rclone mount with a managed lifecycle.", {"remote": self._str(), "path": self._str(""), "mountpoint": self._str(), "read_only": self._bool(False), "vfs_cache_mode": self._enum(["off", "minimal", "writes", "full"], "off"), "dir_cache_time": self._str("5m"), "poll_interval": self._str("1m"), "attr_timeout": self._str("1s"), "allow_other": self._bool(False)}),
             self._tool("mount_stop", "Stop a managed rclone mount by mount id.", {"mount_id": self._str()}),
             self._tool("mount_list", "List managed rclone mounts and their process status.", {}),
@@ -255,7 +257,7 @@ class RcloneMCP:
             if a.get("files_only"): args.append("--files-only")
             if a.get("max_depth", 0): args += ["--max-depth", str(a["max_depth"])]
             return self._run(args, json_output=True)
-        if name == "stat": return self._run(["size", self._remote_path(a["remote"], a["path"]), "--json"], json_output=True)
+        if name == "stat": return self._run(["lsjson", self._remote_path(a["remote"], a["path"]), "--stat"], json_output=True)
         if name == "read_file":
             raw = self._run(["cat", self._remote_path(a["remote"], a["path"])])
             data = raw.encode()
@@ -298,7 +300,11 @@ class RcloneMCP:
             return self._run(args)
         if name == "find_duplicates": return self._find_duplicates(a)
         if name == "dedupe":
-            self._require("full"); args = ["dedupe", "--dedupe-mode", a.get("dedupe_mode", "skip"), self._remote_path(a["remote"], a["path"])]
+            self._require("full")
+            dedupe_mode = a.get("dedupe_mode", "skip")
+            if dedupe_mode not in {"skip", "first", "newest", "oldest", "largest", "smallest", "rename"}:
+                raise PolicyError("dedupe_mode must be a supported non-interactive strategy")
+            args = ["dedupe", "--dedupe-mode", dedupe_mode, self._remote_path(a["remote"], a["path"])]
             if a.get("dry_run", True): args.append("--dry-run")
             return self._run(args)
         if name == "mount_start": return self._mount_start(a)

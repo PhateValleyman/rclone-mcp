@@ -40,6 +40,11 @@ class ServerTests(unittest.TestCase):
         out = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "delete", "arguments": {"remote": "a", "path": "x"}}}, mode="full")
         self.assertNotIn("error", out[0])
 
+    def test_dedupe_rejects_interactive_mode(self):
+        out = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "dedupe", "arguments": {"remote": "a", "path": "x", "dedupe_mode": "interactive"}}}, mode="full")
+        self.assertTrue(out[0]["result"]["isError"])
+        self.assertIn("non-interactive", out[0]["result"]["content"][0]["text"])
+
     def test_config_discovery_and_create(self):
         out = run_server(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "config_providers", "arguments": {}}},
@@ -81,6 +86,15 @@ class ServerTests(unittest.TestCase):
         out = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
         list_files = next(tool for tool in out[0]["result"]["tools"] if tool["name"] == "list_files")
         self.assertEqual(list_files["inputSchema"]["properties"]["max_depth"]["minimum"], 0)
+
+    def test_stat_returns_path_metadata(self):
+        out = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "stat", "arguments": {"remote": "a", "path": "one.txt"}}})
+        payload = json.loads(out[0]["result"]["content"][0]["text"])
+        self.assertEqual(payload, {"Path": "one.txt", "Name": "one.txt", "Size": 10, "IsDir": False})
+
+    def test_package_and_server_versions_match(self):
+        out = run_server({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        self.assertEqual(out[0]["result"]["serverInfo"]["version"], "0.2.0")
 
 
 if __name__ == "__main__":

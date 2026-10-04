@@ -15,6 +15,7 @@ The server delegates storage operations to the installed `rclone` binary. It doe
 - Redacted configuration inspection; credentials are not intentionally returned by `config_show`.
 - No mandatory runtime dependency beyond Python and rclone.
 - Local upload/download paths restricted to a configurable directory.
+- A consolidated [rclone-mcp skill](rclone-mcp-skill.md) covering provider setup and safe backend operations.
 
 ## Requirements
 
