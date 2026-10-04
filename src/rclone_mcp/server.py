@@ -7,17 +7,17 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 SERVER_NAME = "rclone-mcp"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -47,6 +47,8 @@ class RcloneMCP:
         self.max_output = _env_int("RCLONE_MCP_MAX_OUTPUT", 2_000_000)
         self.max_scan_files = _env_int("RCLONE_MCP_MAX_SCAN_FILES", 100_000)
         self.config = os.environ.get("RCLONE_CONFIG")
+        self._mounts: dict[str, subprocess.Popen[str]] = {}
+        self._mount_lock = threading.Lock()
 
     def _check_remote(self, remote: str) -> str:
         if not isinstance(remote, str) or not remote.strip():
@@ -159,7 +161,7 @@ class RcloneMCP:
             self._tool("config_reconnect", "Re-authenticate an existing remote through rclone.", {"name": self._str(), "all": self._bool(False)}),
             self._tool("config_interactive", "Run the native rclone interactive configuration wizard with supplied answers.", {"input_lines": {"type": "array", "items": {"type": "string"}}, "all": self._bool(False)}),
             self._tool("config_continue", "Continue rclone's non-interactive provider configuration state machine.", {"name": self._str(), "state": self._str(), "result": self._str(), "values": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}}),
-            self._tool("list_files", "List files and directories on a remote.", {"remote": self._str(), "path": self._str(""), "recursive": self._bool(False), "files_only": self._bool(False), "max_depth": self._int(0)}),
+            self._tool("list_files", "List files and directories on a remote.", {"remote": self._str(), "path": self._str(""), "recursive": self._bool(False), "files_only": self._bool(False), "max_depth": self._int(0, minimum=0)}),
             self._tool("stat", "Return metadata for a remote path.", {"remote": self._str(), "path": self._str()}),
             self._tool("read_file", "Read a UTF-8 text file from a remote.", {"remote": self._str(), "path": self._str(), "max_bytes": self._int(1_000_000)}),
             self._tool("download", "Download a remote path into the sandbox local root.", {"remote": self._str(), "path": self._str(), "local_path": self._str()}),
@@ -175,6 +177,9 @@ class RcloneMCP:
             self._tool("check", "Compare source and destination for equality.", {"source_remote": self._str(), "source_path": self._str(""), "destination_remote": self._str(), "destination_path": self._str(""), "size_only": self._bool(False)}),
             self._tool("find_duplicates", "Find duplicate files within or across remotes using hashes and size fallback.", {"remotes": self._arr(), "path": self._str(""), "by": self._enum(["hash", "size", "hash_or_size"], "hash_or_size"), "max_files_per_remote": self._int(100000), "max_groups": self._int(1000)}),
             self._tool("dedupe", "Run rclone dedupe interactively in a chosen mode.", {"remote": self._str(), "path": self._str(), "dedupe_mode": self._enum(["interactive", "skip", "first", "newest", "oldest", "largest", "smallest", "rename"], "skip"), "dry_run": self._bool(True)}),
+            self._tool("mount_start", "Start a foreground rclone mount with a managed lifecycle.", {"remote": self._str(), "path": self._str(""), "mountpoint": self._str(), "read_only": self._bool(False), "vfs_cache_mode": self._enum(["off", "minimal", "writes", "full"], "off"), "dir_cache_time": self._str("5m"), "poll_interval": self._str("1m"), "attr_timeout": self._str("1s"), "allow_other": self._bool(False)}),
+            self._tool("mount_stop", "Stop a managed rclone mount by mount id.", {"mount_id": self._str()}),
+            self._tool("mount_list", "List managed rclone mounts and their process status.", {}),
         ]
 
     @staticmethod
@@ -186,7 +191,7 @@ class RcloneMCP:
     @staticmethod
     def _bool(default: bool) -> dict[str, Any]: return {"type": "boolean", "default": default}
     @staticmethod
-    def _int(default: int) -> dict[str, Any]: return {"type": "integer", "default": default, "minimum": 1}
+    def _int(default: int, minimum: int = 1) -> dict[str, Any]: return {"type": "integer", "default": default, "minimum": minimum}
     @staticmethod
     def _arr() -> dict[str, Any]: return {"type": "array", "items": {"type": "string", "minLength": 1}}
     @staticmethod
@@ -296,7 +301,75 @@ class RcloneMCP:
             self._require("full"); args = ["dedupe", "--dedupe-mode", a.get("dedupe_mode", "skip"), self._remote_path(a["remote"], a["path"])]
             if a.get("dry_run", True): args.append("--dry-run")
             return self._run(args)
+        if name == "mount_start": return self._mount_start(a)
+        if name == "mount_stop": return self._mount_stop(a)
+        if name == "mount_list": return self._mount_list()
         raise ValueError(f"unknown tool: {name}")
+
+    def _mount_start(self, a: dict[str, Any]) -> dict[str, Any]:
+        self._require("readwrite")
+        mountpoint = self._local_path(a["mountpoint"])
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        if not mountpoint.is_dir():
+            raise PolicyError("mountpoint must be a directory")
+        mount_id = hashlib.sha256(str(mountpoint).encode()).hexdigest()[:16]
+        with self._mount_lock:
+            existing = self._mounts.get(mount_id)
+            if existing is not None and existing.poll() is None:
+                raise PolicyError(f"mountpoint is already managed: {mountpoint}")
+            self._mounts.pop(mount_id, None)
+        args = ["mount", self._remote_path(a["remote"], a.get("path", "")), str(mountpoint), "--foreground"]
+        if a.get("read_only"):
+            args.append("--read-only")
+        args += ["--vfs-cache-mode", a.get("vfs_cache_mode", "off"), "--dir-cache-time", str(a.get("dir_cache_time", "5m")), "--poll-interval", str(a.get("poll_interval", "1m")), "--attr-timeout", str(a.get("attr_timeout", "1s"))]
+        if a.get("allow_other"):
+            args.append("--allow-other")
+        command = [self.rclone] + (["--config", self.config] if self.config else []) + args
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"rclone executable not found: {self.rclone}") from exc
+        time.sleep(0.05)
+        if process.poll() is not None:
+            raise RuntimeError(f"rclone mount exited with {process.returncode}")
+        with self._mount_lock:
+            self._mounts[mount_id] = process
+        return {"mount_id": mount_id, "mountpoint": str(mountpoint), "remote": self._remote_path(a["remote"], a.get("path", "")), "pid": process.pid}
+
+    def _mount_stop(self, a: dict[str, Any]) -> dict[str, Any]:
+        self._require("readwrite")
+        mount_id = str(a["mount_id"])
+        with self._mount_lock:
+            process = self._mounts.pop(mount_id, None)
+        if process is None:
+            raise PolicyError(f"unknown mount id: {mount_id}")
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=min(self.timeout, 10))
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        return {"mount_id": mount_id, "stopped": True, "returncode": process.returncode}
+
+    def _mount_list(self) -> dict[str, Any]:
+        mounts = []
+        with self._mount_lock:
+            for mount_id, process in list(self._mounts.items()):
+                if process.poll() is not None:
+                    self._mounts.pop(mount_id, None)
+                    continue
+                mounts.append({"mount_id": mount_id, "pid": process.pid, "running": True})
+        return {"mounts": mounts}
+
+    def close(self) -> None:
+        with self._mount_lock:
+            mount_ids = list(self._mounts)
+        for mount_id in mount_ids:
+            try:
+                self._mount_stop({"mount_id": mount_id})
+            except Exception:
+                pass
 
     def _find_duplicates(self, a: dict[str, Any]) -> dict[str, Any]:
         remotes = a.get("remotes") or []
@@ -329,28 +402,44 @@ def main() -> int:
     try: server = RcloneMCP()
     except Exception as exc:
         print(str(exc), file=sys.stderr); return 2
-    for line in sys.stdin:
-        if not line.strip(): continue
-        req_id = None
-        try:
-            req = json.loads(line); req_id = req.get("id"); method = req.get("method"); params = req.get("params") or {}
-            if method == "initialize":
-                result = {"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}, "instructions": "Use tools/list for the complete rclone tool catalog. Destructive operations are policy-gated by environment mode."}
-            elif method == "notifications/initialized" or method == "notifications/cancelled": continue
-            elif method == "ping": result = {}
-            elif method == "tools/list": result = {"tools": server.tools()}
-            elif method == "tools/call":
-                name = params.get("name"); args = params.get("arguments") or {}
-                result = {"content": [{"type": "text", "text": json.dumps(server.call(name, args), ensure_ascii=False, indent=2, default=str)}], "isError": False}
-            else: raise ValueError(f"method not found: {method}")
-            if req_id is not None: print(json.dumps(_response(req_id, result), ensure_ascii=False), flush=True)
-        except Exception as exc:
-            if req_id is not None:
-                if req.get("method") == "tools/call":
-                    result = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
-                    print(json.dumps(_response(req_id, result), ensure_ascii=False), flush=True)
+    try:
+        for line in sys.stdin:
+            if not line.strip(): continue
+            req_id = None
+            req: dict[str, Any] = {}
+            request_valid = False
+            try:
+                req = json.loads(line)
+                if not isinstance(req, dict) or req.get("jsonrpc") != "2.0" or not isinstance(req.get("method"), str):
+                    raise ValueError("invalid JSON-RPC request")
+                req_id = req.get("id"); method = req["method"]; params = req.get("params") or {}
+                if not isinstance(params, dict):
+                    raise ValueError("params must be an object")
+                request_valid = True
+                if method == "initialize":
+                    result = {"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}, "instructions": "Use tools/list for the complete rclone tool catalog. Destructive operations are policy-gated by environment mode."}
+                elif method == "notifications/initialized" or method == "notifications/cancelled": continue
+                elif method == "ping": result = {}
+                elif method == "tools/list": result = {"tools": server.tools()}
+                elif method == "tools/call":
+                    name = params.get("name"); args = params.get("arguments") or {}
+                    if not isinstance(name, str) or not isinstance(args, dict):
+                        raise ValueError("tools/call requires a tool name and object arguments")
+                    result = {"content": [{"type": "text", "text": json.dumps(server.call(name, args), ensure_ascii=False, indent=2, default=str)}], "isError": False}
+                else: raise ValueError(f"method not found: {method}")
+                if req_id is not None: print(json.dumps(_response(req_id, result), ensure_ascii=False), flush=True)
+            except Exception as exc:
+                if request_valid and req_id is None:
+                    continue
                 else:
-                    print(json.dumps(_response(req_id, error={"code": -32000, "message": str(exc)}), ensure_ascii=False), flush=True)
+                    if req.get("method") == "tools/call" and req_id is not None:
+                        result = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+                        print(json.dumps(_response(req_id, result), ensure_ascii=False), flush=True)
+                    else:
+                        code = -32000 if request_valid else -32600
+                        print(json.dumps(_response(req_id, error={"code": code, "message": str(exc)}), ensure_ascii=False), flush=True)
+    finally:
+        server.close()
     return 0
 
 

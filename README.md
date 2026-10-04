@@ -10,6 +10,7 @@ The server delegates storage operations to the installed `rclone` binary. It doe
 - Read-only, read-write and full security modes.
 - File listing, metadata, text reading, upload, download, copy, move, sync and deletion.
 - Cross-remote duplicate detection using hashes with a size fallback.
+- Managed foreground mounts with start, stop, status, read-only mode and bounded VFS cache settings.
 - Provider-aware `rclone.conf` management through `config_providers`, `config_create`, `config_update`, `config_continue` and `config_interactive`.
 - Redacted configuration inspection; credentials are not intentionally returned by `config_show`.
 - No mandatory runtime dependency beyond Python and rclone.
@@ -86,7 +87,7 @@ RCLONE_MCP_LOCAL_ROOT=/home/username/.local/share/rclone-mcp
 | Mode | Permitted operations |
 |---|---|
 | `readonly` (default) | Listing, metadata, reading, searching, checking, duplicate scans and provider discovery |
-| `readwrite` | Read-only operations plus upload, download, mkdir, copy, move, links and config create/update |
+| `readwrite` | Read-only operations plus upload, download, mkdir, copy, move, links, config create/update and managed mounts |
 | `full` | Read-write operations plus sync, delete, purge, dedupe and deletion of remote definitions |
 
 Destructive file tools default to `dry_run=true`. `config_delete` and `config_password` additionally require `confirm=true`.
@@ -289,6 +290,20 @@ Read gdrive:Reports/status.md with read_file, limited to 200000 bytes, and summa
 - `config_continue` continues a provider question/state flow.
 - `config_interactive` accepts explicit `input_lines`; it never consumes MCP protocol stdin.
 - `config_delete` requires `full` and `confirm=true`.
+
+### Managed mounts
+
+`mount_start`, `mount_stop` and `mount_list` manage foreground `rclone mount` processes owned by this MCP server. Mountpoints are created only below `RCLONE_MCP_LOCAL_ROOT`, and every mount uses `--foreground` so the process can be stopped and cleaned up when the MCP server exits.
+
+Example workflow:
+
+```text
+Start a read-only mount of gdrive:Documents at mounts/documents with vfs_cache_mode="writes". Keep it below the configured local root. Then call mount_list and report the mount_id. Do not enable allow_other.
+```
+
+`allow_other` is opt-in because it requires host-level FUSE configuration. `vfs_cache_mode`, `dir_cache_time`, `poll_interval` and `attr_timeout` are explicit fields rather than an unrestricted extra-arguments escape hatch.
+
+An interactive two-panel `fzf` file manager remains intentionally separate from the MCP stdio server: MCP clients do not provide a safe shared TTY. A future `rclone-mcp-fzf` companion can use these same policy rules while keeping interactive terminal input out of JSON-RPC.
 
 ## Troubleshooting
 

@@ -8,11 +8,12 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 SRC = ROOT / "src"
 FAKE = ROOT / "tests" / "fake_rclone.py"
+FAKE_MOUNT = ROOT / "tests" / "fake_rclone_mount.py"
 
 
-def run_server(*requests, mode="readonly"):
+def run_server(*requests, mode="readonly", rclone=FAKE):
     env = os.environ.copy()
-    env.update({"PYTHONPATH": str(SRC), "RCLONE_MCP_RCLONE": str(FAKE), "RCLONE_MCP_MODE": mode})
+    env.update({"PYTHONPATH": str(SRC), "RCLONE_MCP_RCLONE": str(rclone), "RCLONE_MCP_MODE": mode})
     proc = subprocess.run([sys.executable, "-m", "rclone_mcp.server"], input="\n".join(json.dumps(x) for x in requests) + "\n", text=True, capture_output=True, env=env, check=True)
     return [json.loads(x) for x in proc.stdout.splitlines() if x.strip()]
 
@@ -58,6 +59,28 @@ class ServerTests(unittest.TestCase):
         out = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "config_interactive", "arguments": {}}}, mode="readwrite")
         self.assertTrue(out[0]["result"]["isError"])
         self.assertIn("input_lines is required", out[0]["result"]["content"][0]["text"])
+
+    def test_mount_lifecycle(self):
+        out = run_server(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "mount_start", "arguments": {"remote": "a", "mountpoint": "mount-test", "read_only": True, "vfs_cache_mode": "writes"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "mount_list", "arguments": {}}},
+            mode="readwrite",
+            rclone=FAKE_MOUNT,
+        )
+        self.assertFalse(out[0]["result"]["isError"])
+        mount = json.loads(out[0]["result"]["content"][0]["text"])
+        self.assertEqual(mount["remote"], "a:")
+        self.assertTrue(out[1]["result"]["isError"] is False)
+        self.assertEqual(len(json.loads(out[1]["result"]["content"][0]["text"])["mounts"]), 1)
+
+    def test_invalid_json_rpc_gets_error_response(self):
+        out = run_server({"id": 1, "method": "ping", "params": {}})
+        self.assertEqual(out[0]["error"]["code"], -32600)
+
+    def test_max_depth_schema_allows_zero(self):
+        out = run_server({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        list_files = next(tool for tool in out[0]["result"]["tools"] if tool["name"] == "list_files")
+        self.assertEqual(list_files["inputSchema"]["properties"]["max_depth"]["minimum"], 0)
 
 
 if __name__ == "__main__":
